@@ -296,11 +296,12 @@ class MemoryMuon(torch.optim.Optimizer):
         momentum=0.95,
         nesterov=True,
         ns_steps=5,
-        num_centroids=10,
-        centroid_dim=1024,
+        num_centroids=16,
+        centroid_dim=64,
         epsilon=0.1,
         scalar_steps=5,
         centroids_steps=5,
+        lambda_memory=0.1,
         scalar_lr=1e-2,
         scalar_momentum=0.9,
         scalar_weight_decay=0.0,
@@ -351,6 +352,7 @@ class MemoryMuon(torch.optim.Optimizer):
         self.epsilon = epsilon
         self.scalar_steps = scalar_steps
         self.centroids_steps = centroids_steps
+        self.lambda_memory = lambda_memory
 
         self._scalar_optimizer = torch.optim.SGD(
             [self.centroid_scores],
@@ -379,10 +381,25 @@ class MemoryMuon(torch.optim.Optimizer):
         if self.pi is not None and (self.pi.device != device or self.pi.dtype != dtype):
             self.pi = self.pi.to(device=device, dtype=dtype)
 
-    def _memory_dual_objective(self, G, C, g, epsilon):
-        if G.ndim == 1:
+    def _flatten_gradient(self, G):
+        if G.ndim == 4:
+            G = G.view(len(G), -1)
+        elif G.ndim == 1:
             G = G.unsqueeze(0)
-        dists = torch.cdist(G, C).square()
+        return G
+
+    def _project_gradient(self, G):
+        G = self._flatten_gradient(G)
+        if self.pi is None:
+            self.build_pi(G.size(-1), device=G.device, dtype=G.dtype)
+        if G.size(-1) != self.centroid_dim:
+            return G @ self.pi.t()
+        return G
+
+    def _memory_dual_objective(self, G_proj, C, g, epsilon):
+        if G_proj.ndim == 1:
+            G_proj = G_proj.unsqueeze(0)
+        dists = torch.cdist(G_proj, C).square()
         logits = (-dists + g.unsqueeze(0)) / epsilon
         log_m = torch.log(torch.tensor(float(C.size(0)), device=C.device, dtype=C.dtype))
         return g.mean() - epsilon * (torch.logsumexp(logits, dim=1) - log_m).mean()
@@ -392,23 +409,14 @@ class MemoryMuon(torch.optim.Optimizer):
         scalar_steps = self.scalar_steps if scalar_steps is None else scalar_steps
         centroids_steps = self.centroids_steps if centroids_steps is None else centroids_steps
 
-        if G.ndim == 1:
-            G = G.unsqueeze(0)
-
-        device = G.device
-        dtype = G.dtype
-        self._ensure_memory_device(device, dtype)
-
-        if self.pi is None:
-            self.build_pi(G.size(-1), device=device, dtype=dtype)
-
-        if G.size(-1) != self.centroid_dim:
-            G = G @ self.pi.t()
+        G = self._flatten_gradient(G)
+        self._ensure_memory_device(G.device, G.dtype)
+        G_proj = self._project_gradient(G)
 
         for _ in range(scalar_steps):
             self._scalar_optimizer.zero_grad(set_to_none=True)
             objective_g = self._memory_dual_objective(
-                G,
+                G_proj,
                 self.centroids.detach(),
                 self.centroid_scores,
                 epsilon,
@@ -419,7 +427,7 @@ class MemoryMuon(torch.optim.Optimizer):
         for _ in range(centroids_steps):
             self._centroids_optimizer.zero_grad(set_to_none=True)
             objective_c = self._memory_dual_objective(
-                G,
+                G_proj,
                 self.centroids,
                 self.centroid_scores.detach(),
                 epsilon,
@@ -429,6 +437,32 @@ class MemoryMuon(torch.optim.Optimizer):
             self.centroids.data = self.centroids.data / (
                 self.centroids.data.norm(dim=1, keepdim=True) + 1e-8
             )
+
+    def _memory_correction_projected(self, G):
+        G = self._flatten_gradient(G)
+        self._ensure_memory_device(G.device, G.dtype)
+        G_proj = self._project_gradient(G)
+        P = torch.cat([self.centroids.detach(), G_proj], dim=0)
+        P_tilde = zeropower_via_newtonschulz5(P, steps=self.param_groups[0]["ns_steps"])
+        return P_tilde[-G_proj.size(0):]
+
+    def memory_correction(self, G):
+        G = self._flatten_gradient(G)
+        correction_proj = self._memory_correction_projected(G)
+        if G.size(-1) != self.centroid_dim:
+            correction = correction_proj @ self.pi
+        else:
+            correction = correction_proj
+        return correction.reshape(G.shape)
+
+    def corrected_gradient(self, G, lambda_memory=None, ns_steps=None):
+        lambda_memory = self.lambda_memory if lambda_memory is None else lambda_memory
+        ns_steps = self.param_groups[0]["ns_steps"] if ns_steps is None else ns_steps
+        G = self._flatten_gradient(G)
+        correction = self.memory_correction(G)
+        G_tilde_input = G + lambda_memory * correction
+        G_tilde = zeropower_via_newtonschulz5(G_tilde_input, steps=ns_steps)
+        return G_tilde.reshape(G.shape)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -443,19 +477,30 @@ class MemoryMuon(torch.optim.Optimizer):
             for p in group["params"]:
                 if p.grad is None:
                     p.grad = torch.zeros_like(p)
+
                 state = self.state[p]
                 if len(state) == 0:
                     state["momentum_buffer"] = torch.zeros_like(p)
-                update = muon_update(
-                    p.grad,
-                    state["momentum_buffer"],
-                    beta=group["momentum"],
+
+                G_t = self._flatten_gradient(p.grad)
+                self.update_memory(G_t)
+                G_tilde = self.corrected_gradient(
+                    G_t,
+                    lambda_memory=self.lambda_memory,
                     ns_steps=group["ns_steps"],
-                    nesterov=group["nesterov"],
                 )
+
+                momentum_buffer = self._flatten_gradient(state["momentum_buffer"])
+                momentum_buffer.lerp_(G_tilde, 1 - group["momentum"])
+
+                if group["nesterov"]:
+                    update = G_tilde.lerp(momentum_buffer, group["momentum"])
+                else:
+                    update = momentum_buffer
+
+                state["momentum_buffer"] = momentum_buffer.reshape_as(p)
+
                 p.mul_(1 - group["lr"] * group["weight_decay"])
-                p.add_(update.reshape(p.shape), alpha=-group["lr"])
+                p.add_(update.reshape_as(p), alpha=-group["lr"])
 
         return loss
-
-        

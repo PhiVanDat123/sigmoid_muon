@@ -284,3 +284,178 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                     p.add_(update, alpha=-group["lr"])
 
         return loss
+
+
+
+class MemoryMuon(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params,
+        lr=0.02,
+        weight_decay=0.0,
+        momentum=0.95,
+        nesterov=True,
+        ns_steps=5,
+        num_centroids=10,
+        centroid_dim=1024,
+        epsilon=0.1,
+        scalar_steps=5,
+        centroids_steps=5,
+        scalar_lr=1e-2,
+        scalar_momentum=0.9,
+        scalar_weight_decay=0.0,
+        centroids_lr=1e-2,
+        centroids_momentum=0.9,
+        centroids_weight_decay=0.0,
+    ):
+        main_params = list(params)
+
+        C = torch.randn(num_centroids, centroid_dim)
+        C = C / (C.norm(dim=1, keepdim=True) + 1e-8)
+        self.centroids = torch.nn.Parameter(C)
+        self.centroid_scores = torch.nn.Parameter(torch.zeros(num_centroids))
+        self.pi = None
+
+        param_groups = [
+            dict(
+                params=main_params,
+                lr=lr,
+                weight_decay=weight_decay,
+                momentum=momentum,
+                nesterov=nesterov,
+                ns_steps=ns_steps,
+                use_memory=False,
+            ),
+            dict(
+                params=[self.centroid_scores],
+                lr=scalar_lr,
+                weight_decay=scalar_weight_decay,
+                momentum=scalar_momentum,
+                use_memory=True,
+                memory_role="scores",
+            ),
+            dict(
+                params=[self.centroids],
+                lr=centroids_lr,
+                weight_decay=centroids_weight_decay,
+                momentum=centroids_momentum,
+                use_memory=True,
+                memory_role="centroids",
+            ),
+        ]
+
+        super().__init__(param_groups, dict())
+
+        self.num_centroids = num_centroids
+        self.centroid_dim = centroid_dim
+        self.epsilon = epsilon
+        self.scalar_steps = scalar_steps
+        self.centroids_steps = centroids_steps
+
+        self._scalar_optimizer = torch.optim.SGD(
+            [self.centroid_scores],
+            lr=scalar_lr,
+            momentum=scalar_momentum,
+            weight_decay=scalar_weight_decay,
+            maximize=True,
+        )
+
+        self._centroids_optimizer = torch.optim.SGD(
+            [self.centroids],
+            lr=centroids_lr,
+            momentum=centroids_momentum,
+            weight_decay=centroids_weight_decay,
+        )
+
+    def build_pi(self, input_dim, device=None, dtype=torch.float32):
+        pi = torch.randint(0, 2, (self.centroid_dim, input_dim), device=device)
+        pi = pi * 2 - 1
+        self.pi = pi.to(dtype)
+
+    def _ensure_memory_device(self, device, dtype):
+        if self.centroids.device != device or self.centroids.dtype != dtype:
+            self.centroids.data = self.centroids.data.to(device=device, dtype=dtype)
+            self.centroid_scores.data = self.centroid_scores.data.to(device=device, dtype=dtype)
+        if self.pi is not None and (self.pi.device != device or self.pi.dtype != dtype):
+            self.pi = self.pi.to(device=device, dtype=dtype)
+
+    def _memory_dual_objective(self, G, C, g, epsilon):
+        if G.ndim == 1:
+            G = G.unsqueeze(0)
+        dists = torch.cdist(G, C).square()
+        logits = (-dists + g.unsqueeze(0)) / epsilon
+        log_m = torch.log(torch.tensor(float(C.size(0)), device=C.device, dtype=C.dtype))
+        return g.mean() - epsilon * (torch.logsumexp(logits, dim=1) - log_m).mean()
+
+    def update_memory(self, G, epsilon=None, scalar_steps=None, centroids_steps=None):
+        epsilon = self.epsilon if epsilon is None else epsilon
+        scalar_steps = self.scalar_steps if scalar_steps is None else scalar_steps
+        centroids_steps = self.centroids_steps if centroids_steps is None else centroids_steps
+
+        if G.ndim == 1:
+            G = G.unsqueeze(0)
+
+        device = G.device
+        dtype = G.dtype
+        self._ensure_memory_device(device, dtype)
+
+        if self.pi is None:
+            self.build_pi(G.size(-1), device=device, dtype=dtype)
+
+        if G.size(-1) != self.centroid_dim:
+            G = G @ self.pi.t()
+
+        for _ in range(scalar_steps):
+            self._scalar_optimizer.zero_grad(set_to_none=True)
+            objective_g = self._memory_dual_objective(
+                G,
+                self.centroids.detach(),
+                self.centroid_scores,
+                epsilon,
+            )
+            objective_g.backward()
+            self._scalar_optimizer.step()
+
+        for _ in range(centroids_steps):
+            self._centroids_optimizer.zero_grad(set_to_none=True)
+            objective_c = self._memory_dual_objective(
+                G,
+                self.centroids,
+                self.centroid_scores.detach(),
+                epsilon,
+            )
+            (-objective_c).backward()
+            self._centroids_optimizer.step()
+            self.centroids.data = self.centroids.data / (
+                self.centroids.data.norm(dim=1, keepdim=True) + 1e-8
+            )
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            if group.get("use_memory", False):
+                continue
+            for p in group["params"]:
+                if p.grad is None:
+                    p.grad = torch.zeros_like(p)
+                state = self.state[p]
+                if len(state) == 0:
+                    state["momentum_buffer"] = torch.zeros_like(p)
+                update = muon_update(
+                    p.grad,
+                    state["momentum_buffer"],
+                    beta=group["momentum"],
+                    ns_steps=group["ns_steps"],
+                    nesterov=group["nesterov"],
+                )
+                p.mul_(1 - group["lr"] * group["weight_decay"])
+                p.add_(update.reshape(p.shape), alpha=-group["lr"])
+
+        return loss
+
+        

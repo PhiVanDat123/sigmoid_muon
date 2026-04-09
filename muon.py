@@ -484,19 +484,20 @@ class MemoryMuon(torch.optim.Optimizer):
 
                 G_t = self._flatten_gradient(p.grad)
                 self.update_memory(G_t)
-                G_tilde = self.corrected_gradient(
-                    G_t,
-                    lambda_memory=self.lambda_memory,
-                    ns_steps=group["ns_steps"],
-                )
+
+                correction = self.memory_correction(G_t)
+                G_hat = G_t + self.lambda_memory * correction
 
                 momentum_buffer = self._flatten_gradient(state["momentum_buffer"])
-                momentum_buffer.lerp_(G_tilde, 1 - group["momentum"])
+                momentum_buffer.lerp_(G_hat, 1 - group["momentum"])
 
                 if group["nesterov"]:
-                    update = G_tilde.lerp(momentum_buffer, group["momentum"])
+                    update = G_hat.lerp(momentum_buffer, group["momentum"])
                 else:
                     update = momentum_buffer
+
+                update = zeropower_via_newtonschulz5(update, steps=group["ns_steps"])
+                update *= max(1, update.size(-2) / update.size(-1)) ** 0.5
 
                 state["momentum_buffer"] = momentum_buffer.reshape_as(p)
 

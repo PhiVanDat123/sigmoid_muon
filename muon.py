@@ -1,5 +1,6 @@
 import torch
 import torch.distributed as dist
+import numpy as np
 
 
 def zeropower_via_newtonschulz5(G, steps: int):
@@ -31,34 +32,29 @@ def zeropower_via_newtonschulz5(G, steps: int):
     return X
 
 def newton_schulz_sigmoid_rect(G, iterations=5):
-    """
-    Xấp xỉ Sigmoid ma trận chữ nhật không dùng SVD.
-    Sử dụng Newton-Schulz cho Polar Decomposition.
-    """
-    m, n = G.shape
-    # Để hội tụ, singular values phải <= sqrt(3).
-    # Ta dùng chuẩn Frobenius để scale an toàn.
-    norm_G = np.linalg.norm(G, ord='fro')
+    squeezed = G.ndim == 1
+    if squeezed:
+        G = G.unsqueeze(0)
 
-    # --- 1. Tính Polar Factor (Q = U*Vh) ---
-    # Đây là "khung xương" hướng của ma trận chữ nhật
+    m, n = G.shape
+    # Dùng torch thay numpy để tính trên GPU
+    norm_G = G.norm(p='fro')
+
     Q = G / (norm_G + 1e-8)
-    In = np.eye(n)
+    In = torch.eye(n, device=G.device, dtype=G.dtype)  # ← torch, không phải np.eye
 
     for _ in range(iterations):
-        # Công thức lặp: Q = 0.5 * Q * (3I - Q^T * Q)
-        # Đây là phép nhân ma trận thuần túy (GEMM)
         Q = 0.5 * Q @ (3 * In - Q.T @ Q)
 
-    # --- 2. Tính Tanh Factor xấp xỉ ---
-    # Chúng ta dùng dải scale nhỏ hơn để tạo độ cong mượt (Sigmoid)
-    # Thay vì hội tụ cứng về Sign, ta giữ ở mức Tanh
     T = G / 4.0
-    for _ in range(2): # 2 bước là đủ cho độ mượt
+    for _ in range(2):
         T = 0.5 * T @ (3 * In - T.T @ T)
 
-    # --- 3. Kết hợp: Sigmoid(G) = 0.5 * (Polar + Tanh) ---
-    return 0.5 * Q + 0.5 * T
+    result = 0.5 * Q + 0.5 * T
+
+    if squeezed:
+        result = result.squeeze(0)
+    return result
 
 def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
     momentum.lerp_(grad, 1 - beta)
@@ -346,6 +342,95 @@ class MuonWithAuxAdam(torch.optim.Optimizer):
 
         return loss
 
+class MuonWithAuxAdam_sigmoid(torch.optim.Optimizer):
+    """
+    Distributed Muon variant that can be used for all parameters in the network, since it runs an
+    internal AdamW for the parameters that are not compatible with Muon. The user must manually
+    specify which parameters shall be optimized with Muon and which with Adam by passing in a
+    list of param_groups with the `use_muon` flag set.
+
+    The point of this class is to allow the user to have a single optimizer in their code, rather
+    than having both a Muon and an Adam which each need to be stepped.
+
+    You can see an example usage below:
+
+    https://github.com/KellerJordan/modded-nanogpt/blob/master/records/052525_MuonWithAuxAdamExample/b01550f9-03d8-4a9c-86fe-4ab434f1c5e0.txt#L470
+    ```
+    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
+    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
+    scalar_params = [p for p in model.parameters() if p.ndim < 2]
+    head_params = [model.lm_head.weight]
+
+    from muon import MuonWithAuxAdam
+    adam_groups = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0.6), dict(params=scalar_params, lr=0.04)]
+    adam_groups = [dict(**g, betas=(0.8, 0.95), eps=1e-10, use_muon=False) for g in adam_groups]
+    muon_group = dict(params=hidden_matrix_params, lr=0.05, momentum=0.95, use_muon=True)
+    param_groups = [*adam_groups, muon_group]
+    optimizer = MuonWithAuxAdam(param_groups)
+    ```
+    """
+    def __init__(self, param_groups):
+        for group in param_groups:
+            assert "use_muon" in group
+            if group["use_muon"]:
+                group["params"] = sorted(group["params"], key=lambda x: x.size(), reverse=True)
+                # defaults
+                group["lr"] = group.get("lr", 0.02)
+                group["momentum"] = group.get("momentum", 0.95)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == set(["params", "lr", "momentum", "weight_decay", "use_muon"])
+            else:
+                # defaults
+                group["lr"] = group.get("lr", 3e-4)
+                group["betas"] = group.get("betas", (0.9, 0.95))
+                group["eps"] = group.get("eps", 1e-10)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == set(["params", "lr", "betas", "eps", "weight_decay", "use_muon"])
+        super().__init__(param_groups, dict())
+
+    @torch.no_grad()
+    def step(self, closure=None):
+
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            if group["use_muon"]:
+                params = group["params"]
+                params_pad = params + [torch.empty_like(params[-1])] * (dist.get_world_size() - len(params) % dist.get_world_size())
+                for base_i in range(len(params))[::dist.get_world_size()]:
+                    if base_i + dist.get_rank() < len(params):
+                        p = params[base_i + dist.get_rank()]
+                        if p.grad is None:
+                            # continue
+                            p.grad = torch.zeros_like(p)  # Force synchronization
+                        state = self.state[p]
+                        if len(state) == 0:
+                            state["momentum_buffer"] = torch.zeros_like(p)
+                        update = muon_update_sigmoid(p.grad, state["momentum_buffer"], beta=group["momentum"])
+                        p.mul_(1 - group["lr"] * group["weight_decay"])
+                        p.add_(update.reshape(p.shape), alpha=-group["lr"])
+                    dist.all_gather(params_pad[base_i:base_i + dist.get_world_size()], params_pad[base_i + dist.get_rank()])
+            else:
+                for p in group["params"]:
+                    if p.grad is None:
+                        # continue
+                        p.grad = torch.zeros_like(p)  # Force synchronization
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["exp_avg"] = torch.zeros_like(p)
+                        state["exp_avg_sq"] = torch.zeros_like(p)
+                        state["step"] = 0
+                    state["step"] += 1
+                    update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
+                                         state["step"], group["betas"], group["eps"])
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+
+        return loss
+
 
 class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
     """
@@ -407,6 +492,65 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
 
         return loss
 
+class SingleDeviceMuonWithAuxAdam_sigmoid(torch.optim.Optimizer):
+    """
+    Non-distributed variant of MuonWithAuxAdam.
+    """
+    def __init__(self, param_groups):
+        for group in param_groups:
+            assert "use_muon" in group
+            if group["use_muon"]:
+                # defaults
+                group["lr"] = group.get("lr", 0.02)
+                group["momentum"] = group.get("momentum", 0.95)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == set(["params", "lr", "momentum", "weight_decay", "use_muon"])
+            else:
+                # defaults
+                group["lr"] = group.get("lr", 3e-4)
+                group["betas"] = group.get("betas", (0.9, 0.95))
+                group["eps"] = group.get("eps", 1e-10)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == set(["params", "lr", "betas", "eps", "weight_decay", "use_muon"])
+        super().__init__(param_groups, dict())
+
+    @torch.no_grad()
+    def step(self, closure=None):
+
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            if group["use_muon"]:
+                for p in group["params"]:
+                    if p.grad is None:
+                        # continue
+                        p.grad = torch.zeros_like(p)  # Force synchronization
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["momentum_buffer"] = torch.zeros_like(p)
+                    update = muon_update_sigmoid(p.grad, state["momentum_buffer"], beta=group["momentum"])
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update.reshape(p.shape), alpha=-group["lr"])
+            else:
+                for p in group["params"]:
+                    if p.grad is None:
+                        # continue
+                        p.grad = torch.zeros_like(p)  # Force synchronization
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["exp_avg"] = torch.zeros_like(p)
+                        state["exp_avg_sq"] = torch.zeros_like(p)
+                        state["step"] = 0
+                    state["step"] += 1
+                    update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
+                                         state["step"], group["betas"], group["eps"])
+                    p.mul_(1 - group["lr"] * group["weight_decay"])
+                    p.add_(update, alpha=-group["lr"])
+
+        return loss
 
 
 class MemoryMuon(torch.optim.Optimizer):

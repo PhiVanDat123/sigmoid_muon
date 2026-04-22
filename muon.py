@@ -31,7 +31,7 @@ def zeropower_via_newtonschulz5(G, steps: int):
         X = X.mT
     return X
 
-def newton_schulz_sigmoid_rect(G, iterations=5):
+def newton_schulz_sigmoid_rect(G, steps=5):
     squeezed = G.ndim == 1
     if squeezed:
         G = G.unsqueeze(0)
@@ -43,7 +43,7 @@ def newton_schulz_sigmoid_rect(G, iterations=5):
     Q = G / (norm_G + 1e-8)
     In = torch.eye(n, device=G.device, dtype=G.dtype)  # ← torch, không phải np.eye
 
-    for _ in range(iterations):
+    for _ in range(steps):
         Q = 0.5 * Q @ (3 * In - Q.T @ Q)
 
     T = G / 4.0

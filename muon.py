@@ -46,7 +46,7 @@ def newton_schulz_sigmoid_rect(G, steps=5):
     for _ in range(steps):
         Q = 0.5 * Q @ (3 * In - Q.T @ Q)
 
-    T = G / 4.0
+    T = norm_G / 4.0
     for _ in range(2):
         T = 0.5 * T @ (3 * In - T.T @ T)
 

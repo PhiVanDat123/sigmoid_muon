@@ -37,16 +37,16 @@ def newton_schulz_sigmoid_rect(G, steps=5):
         G = G.unsqueeze(0)
 
     m, n = G.shape
-    # Dùng torch thay numpy để tính trên GPU
+    In = torch.eye(n, device=G.device, dtype=G.dtype)
+
     norm_G = G.norm(p='fro')
+    G_scaled = G / (norm_G + 1e-8)
 
-    Q = G / (norm_G + 1e-8)
-    In = torch.eye(n, device=G.device, dtype=G.dtype)  # ← torch, không phải np.eye
-
+    Q = G_scaled.clone()
     for _ in range(steps):
         Q = 0.5 * Q @ (3 * In - Q.T @ Q)
 
-    T = (norm_G / (4.0 * n)) * In
+    T = G_scaled / 4.0
     for _ in range(2):
         T = 0.5 * T @ (3 * In - T.T @ T)
 

@@ -377,7 +377,7 @@ class MuonWithAuxAdam_sigmoid(torch.optim.Optimizer):
                 # defaults
                 group["lr"] = group.get("lr", 0.02)
                 group["momentum"] = group.get("momentum", 0.95)
-                group["weight_decay"] = group.get("weight_decay", 0)
+                group["weight_decay"] = group.get("weight_decay", 0.01)
                 assert set(group.keys()) == set(["params", "lr", "momentum", "weight_decay", "use_muon"])
             else:
                 # defaults
